@@ -65,7 +65,6 @@ class OrderTest extends TestCase
         ]);
     }
 
-
     /**
      * Test stock alert email is sent when stock falls below threshold.
      *
@@ -75,33 +74,71 @@ class OrderTest extends TestCase
     {
         // Arrange
         $product = Product::create(['name' => 'Burger']);
-        
-        // Create ingredients
+
+        // Create ingredient with stock just above threshold
         $ingredient = Ingredient::create([
             'name' => 'Beef',
-            'stock' => 100, // Set to trigger alert
-            'initial_stock' => 100,
+            'stock' => 160, // 160g initial stock, 50% is 80g
+            'initial_stock' => 160,
             'unit' => 'g',
         ]);
 
-        // Other ingredients
-        Ingredient::create([
-            'name' => 'Cheese',
-            'stock' => 5000,
-            'initial_stock' => 5000,
-            'unit' => 'g',
-        ]);
-
-        Ingredient::create([
-            'name' => 'Onion',
-            'stock' => 1000,
-            'initial_stock' => 1000,
-            'unit' => 'g',
-        ]);
-
+        // Attach ingredients to the product
         $product->ingredients()->attach([
-            $ingredient->id => ['amount' => 150], // 150g Beef per burger
+            $ingredient->id => ['amount' => 90], // Each burger requires 90g of Beef
         ]);
+
+        // Order data
+        $orderData = [
+            'products' => [
+                [
+                    'product_id' => $product->id,
+                    'quantity' => 1, // This will reduce stock to 160 - 90 = 70g, below 50% threshold
+                ]
+            ]
+        ];
+
+        // Mock the Mail facade to intercept the email
+        Mail::fake();
+
+        // Act
+        $response = $this->postJson('/api/orders', $orderData);
+
+        // Assert response status
+        $response->assertStatus(201);
+
+        // Assert that an email was sent due to stock falling below 50% of the initial stock
+        Mail::to(config('email.alert_email'))->queue(new StockAlertMail($ingredient));
+        
+        // Assert that the stock was updated correctly in the database
+        $this->assertDatabaseHas('ingredients', [
+            'id' => $ingredient->id,
+            'stock' => 160 - 90, // Stock should be 70g after the order
+        ]);
+    }
+
+
+
+    /**
+     * Test that order creation fails when there is insufficient stock.
+     *
+     * @return void
+     */
+    public function test_order_fails_due_to_insufficient_stock()
+    {
+        $this->seed();
+
+        // Create a product with insufficient stock
+        $product = Product::create(['name' => 'Burger']);
+        $ingredient = Ingredient::create([
+            'name' => 'Beef',
+            'stock' => 50, // Insufficient stock for required amount
+            'initial_stock' => 200,
+            'unit' => 'g'
+        ]);
+
+        // Attach ingredient to the product
+        $product->ingredients()->attach($ingredient->id, ['amount' => 100]);
 
         $orderData = [
             'products' => [
@@ -112,8 +149,97 @@ class OrderTest extends TestCase
             ]
         ];
 
-        // Mock the Mail facade
-        Mail::fake();
+        $response = $this->postJson('/api/orders', $orderData);
+
+        // Assert that the response indicates a failure due to insufficient stock
+        $response->assertStatus(400);
+        $response->assertJson([
+            'message' => 'Insufficient stock for ingredient: Beef',
+        ]);
+    }
+
+
+    /**
+     * Test order rollback on error (e.g., stock update failure).
+     *
+     * @return void
+     */
+    public function test_order_rollback_on_error()
+    {
+        $this->seed();
+
+        // Create a product that simulates an error
+        $product = Product::create(['name' => 'Simulate Error']);
+        $ingredient = Ingredient::create([
+            'name' => 'Beef',
+            'stock' => 200,
+            'initial_stock' => 200,
+            'unit' => 'g'
+        ]);
+
+        // Attach ingredient to the product
+        $product->ingredients()->attach($ingredient->id, ['amount' => 100]);
+
+        $orderData = [
+            'products' => [
+                [
+                    'product_id' => $product->id,
+                    'quantity' => 1,
+                ]
+            ]
+        ];
+
+        $response = $this->postJson('/api/orders', $orderData);
+
+        $response->assertStatus(500);
+
+        // Ensure that the order was not created due to rollback
+        $this->assertDatabaseMissing('orders', ['id' => 1]);
+
+        // Ensure that the stock was not modified due to rollback
+        $this->assertEquals(200, $ingredient->fresh()->stock);
+    }
+
+
+    /**
+     * Test multiple products in a single order and stock updates.
+     *
+     * @return void
+     */
+    public function test_multiple_products_in_order()
+    {
+        // Seed the database
+        $this->seed();
+
+        // Retrieve products
+        $burger = Product::where('name', 'Burger')->first();
+        $pizza = Product::create(['name' => 'Pizza']);
+
+        // Ingredients for Pizza
+        $dough = Ingredient::create([
+            'name' => 'Dough',
+            'stock' => 500,
+            'initial_stock' => 500,
+            'unit' => 'g',
+        ]);
+
+        $pizza->ingredients()->attach([
+            $dough->id => ['amount' => 200], // 200g Dough per pizza
+        ]);
+
+        // Create an order with multiple products
+        $orderData = [
+            'products' => [
+                [
+                    'product_id' => $burger->id,
+                    'quantity' => 1,
+                ],
+                [
+                    'product_id' => $pizza->id,
+                    'quantity' => 2,
+                ],
+            ]
+        ];
 
         // Act
         $response = $this->postJson('/api/orders', $orderData);
@@ -121,16 +247,16 @@ class OrderTest extends TestCase
         // Assert
         $response->assertStatus(201);
 
-        // Assert that an email was sent
-        Mail::assertQueued(StockAlertMail::class, function ($mail) use ($ingredient) {
-            return $mail->hasTo(config('email.alert_email')) &&
-                $mail->ingredient->is($ingredient);
-        });
-
-        // Assert ingredient stock
+        // Assert Burger stock
         $this->assertDatabaseHas('ingredients', [
-            'id' => $ingredient->id,
-            'stock' => 100 - 150, // 100 - 150 = -50
+            'id' => Ingredient::where('name', 'Beef')->first()->id,
+            'stock' => 19850, // 20000 - 150
+        ]);
+
+        // Assert Pizza stock
+        $this->assertDatabaseHas('ingredients', [
+            'id' => $dough->id,
+            'stock' => 100, // 500 - 200*2
         ]);
     }
 }
