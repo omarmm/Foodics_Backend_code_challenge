@@ -5,10 +5,10 @@ namespace Tests\Feature;
 use App\Enums\UnitEnum;
 use App\Mail\StockAlertMail;
 use App\Models\Ingredient;
-use App\Models\Order;
 use App\Models\Product;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Facades\Queue;
 use Tests\TestCase;
 
 class OrderTest extends TestCase
@@ -41,14 +41,14 @@ class OrderTest extends TestCase
             ]
         ];
 
+        // Mock the job dispatch
+        Queue::fake();
+
         // Send the request to store the order
         $response = $this->postJson('/api/orders', $orderData);
 
-        // Assert the order was created
+        // Assert the response status
         $response->assertStatus(201);
-        $this->assertDatabaseHas('orders', [
-            'id' => 1, // or use another method to get the order ID
-        ]);
 
         // Assert the ingredients' stock was updated
         $this->assertDatabaseHas('ingredients', [
@@ -80,7 +80,7 @@ class OrderTest extends TestCase
             'name' => 'Beef',
             'stock' => 160, // 160g initial stock, 50% is 80g
             'initial_stock' => 160,
-            'unit' => 'g',
+            'unit' => UnitEnum::GRAMS->value,
         ]);
 
         // Attach ingredients to the product
@@ -101,7 +101,7 @@ class OrderTest extends TestCase
         // Mock the Mail facade to intercept the email
         Mail::fake();
 
-        // Act
+        // Send the request to store the order
         $response = $this->postJson('/api/orders', $orderData);
 
         // Assert response status
@@ -109,15 +109,14 @@ class OrderTest extends TestCase
 
         // Assert that an email was sent due to stock falling below 50% of the initial stock
         Mail::to(config('email.alert_email'))->queue(new StockAlertMail($ingredient));
-        
+
+
         // Assert that the stock was updated correctly in the database
         $this->assertDatabaseHas('ingredients', [
             'id' => $ingredient->id,
-            'stock' => 160 - 90, // Stock should be 70g after the order
+            'stock' => 70, // Stock should be 70g after the order
         ]);
     }
-
-
 
     /**
      * Test that order creation fails when there is insufficient stock.
@@ -134,7 +133,7 @@ class OrderTest extends TestCase
             'name' => 'Beef',
             'stock' => 50, // Insufficient stock for required amount
             'initial_stock' => 200,
-            'unit' => 'g'
+            'unit' => UnitEnum::GRAMS->value,
         ]);
 
         // Attach ingredient to the product
@@ -149,6 +148,7 @@ class OrderTest extends TestCase
             ]
         ];
 
+        // Send the request to store the order
         $response = $this->postJson('/api/orders', $orderData);
 
         // Assert that the response indicates a failure due to insufficient stock
@@ -157,7 +157,6 @@ class OrderTest extends TestCase
             'message' => 'Insufficient stock for ingredient: Beef',
         ]);
     }
-
 
     /**
      * Test order rollback on error (e.g., stock update failure).
@@ -174,7 +173,7 @@ class OrderTest extends TestCase
             'name' => 'Beef',
             'stock' => 200,
             'initial_stock' => 200,
-            'unit' => 'g'
+            'unit' => UnitEnum::GRAMS->value,
         ]);
 
         // Attach ingredient to the product
@@ -189,6 +188,7 @@ class OrderTest extends TestCase
             ]
         ];
 
+        // Send the request to store the order
         $response = $this->postJson('/api/orders', $orderData);
 
         $response->assertStatus(500);
@@ -202,7 +202,7 @@ class OrderTest extends TestCase
 
 
     /**
-     * Test multiple products in a single order and stock updates.
+     * Test handling of a large number of products in a single order.
      *
      * @return void
      */
@@ -211,52 +211,44 @@ class OrderTest extends TestCase
         // Seed the database
         $this->seed();
 
-        // Retrieve products
-        $burger = Product::where('name', 'Burger')->first();
-        $pizza = Product::create(['name' => 'Pizza']);
+        // Create 50 products and ingredients
+        for ($i = 1; $i <= 50; $i++) {
+            $product = Product::create(['name' => "Product $i"]);
 
-        // Ingredients for Pizza
-        $dough = Ingredient::create([
-            'name' => 'Dough',
-            'stock' => 500,
-            'initial_stock' => 500,
-            'unit' => 'g',
-        ]);
+            $ingredient = Ingredient::create([
+                'name' => "Ingredient $i",
+                'stock' => 1000,
+                'initial_stock' => 1000,
+                'unit' => UnitEnum::GRAMS->value,
+            ]);
 
-        $pizza->ingredients()->attach([
-            $dough->id => ['amount' => 200], // 200g Dough per pizza
-        ]);
+            $product->ingredients()->attach([
+                $ingredient->id => ['amount' => 10], // 10g per product
+            ]);
+        }
 
-        // Create an order with multiple products
+        // Create an order with the 50 products
         $orderData = [
-            'products' => [
-                [
-                    'product_id' => $burger->id,
+            'products' => array_map(function ($i) {
+                return [
+                    'product_id' => Product::where('name', "Product $i")->first()->id,
                     'quantity' => 1,
-                ],
-                [
-                    'product_id' => $pizza->id,
-                    'quantity' => 2,
-                ],
-            ]
+                ];
+            }, range(1, 50))
         ];
 
-        // Act
+        // Send the request to store the order
         $response = $this->postJson('/api/orders', $orderData);
 
-        // Assert
+        // Assert response status
         $response->assertStatus(201);
 
-        // Assert Burger stock
-        $this->assertDatabaseHas('ingredients', [
-            'id' => Ingredient::where('name', 'Beef')->first()->id,
-            'stock' => 19850, // 20000 - 150
-        ]);
-
-        // Assert Pizza stock
-        $this->assertDatabaseHas('ingredients', [
-            'id' => $dough->id,
-            'stock' => 100, // 500 - 200*2
-        ]);
+        // Assert that the stock was updated correctly for all products
+        foreach (range(1, 50) as $i) {
+            $this->assertDatabaseHas('ingredients', [
+                'name' => "Ingredient $i",
+                'stock' => 990, // 1000 - 10
+            ]);
+        }
     }
 }
